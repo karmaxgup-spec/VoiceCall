@@ -1,0 +1,64 @@
+#pc-overlay {
+    position: fixed; inset: 0; z-index: 99999;
+    background: rgba(0, 0, 0, 0.55);
+    backdrop-filter: blur(6px);
+    display: flex; align-items: center; justify-content: center;
+}
+#pc-overlay.pc-hidden { display: none; }
+
+.pc-phone {
+    width: min(360px, 92vw); height: min(740px, 88vh);
+    border-radius: 42px; padding: 18px 20px 28px;
+    background: linear-gradient(170deg, #2b2f3a 0%, #0d0f14 60%);
+    box-shadow: 0 0 0 8px #1a1c22, 0 30px 80px rgba(0,0,0,.6);
+    color: #f2f2f7; font-family: -apple-system, system-ui, "Segoe UI", Roboto, sans-serif;
+    display: flex; flex-direction: column; justify-content: space-between;
+}
+.pc-topbar { display: flex; justify-content: space-between; font-size: 14px; opacity: .8; }
+
+.pc-call { text-align: center; margin-top: 12px; }
+.pc-avatar {
+    width: 116px; height: 116px; border-radius: 50%; object-fit: cover;
+    box-shadow: 0 0 0 3px rgba(255,255,255,.08);
+}
+.pc-name { font-size: 26px; font-weight: 600; margin-top: 14px; }
+.pc-state { font-size: 15px; opacity: .7; margin-top: 4px; }
+.pc-timer { font-size: 15px; font-variant-numeric: tabular-nums; margin-top: 2px; opacity: .85; }
+.pc-caption {
+    margin: 14px auto 0; max-width: 92%; min-height: 48px;
+    font-size: 15px; line-height: 1.35; opacity: .9;
+}
+
+/* Pulsing ring around the avatar while the AI speaks or you talk */
+#pc-overlay.pc-speaking .pc-avatar,
+#pc-overlay.pc-listening .pc-avatar {
+    animation: pc-pulse 1.2s ease-in-out infinite;
+}
+#pc-overlay.pc-listening .pc-avatar { box-shadow: 0 0 0 4px rgba(52,199,89,.6); }
+@keyframes pc-pulse { 50% { box-shadow: 0 0 0 12px rgba(255,255,255,.08); } }
+
+.pc-wave { display: flex; justify-content: center; align-items: center; gap: 5px; height: 40px; }
+.pc-wave i { width: 5px; height: 6px; border-radius: 3px; background: #8e8e93; transition: height .15s; }
+#pc-overlay.pc-speaking .pc-wave i { background: #0a84ff; animation: pc-bars .9s ease-in-out infinite; }
+#pc-overlay.pc-speaking .pc-wave i:nth-child(2) { animation-delay: .15s; }
+#pc-overlay.pc-speaking .pc-wave i:nth-child(3) { animation-delay: .3s; }
+#pc-overlay.pc-speaking .pc-wave i:nth-child(4) { animation-delay: .45s; }
+#pc-overlay.pc-speaking .pc-wave i:nth-child(5) { animation-delay: .6s; }
+#pc-overlay.pc-listening .pc-wave i { background: #34c759; animation: pc-bars .6s ease-in-out infinite; }
+@keyframes pc-bars { 50% { height: 34px; } }
+
+.pc-row { display: flex; justify-content: space-evenly; align-items: center; }
+.pc-incoming { display: none; }
+.pc-active { display: none; }
+.pc-btn {
+    width: 68px; height: 68px; border-radius: 50%; border: none; cursor: pointer;
+    font-size: 26px; color: #fff; background: #3a3a3c;
+}
+.pc-btn.pc-mute.pc-on { background: #f2f2f7; color: #000; }
+.pc-decline, .pc-end { background: #ff3b30; }
+.pc-answer { background: #34c759; }
+
+.pc-call-btn { font-size: 18px; padding: 6px 8px; cursor: pointer; opacity: .85; }
+.pc-call-btn:hover { opacity: 1; }
+
+#pc_settings label { display: block; margin: 8px 0; }
