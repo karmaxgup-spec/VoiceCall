@@ -1,17 +1,22 @@
-
 import { extension_settings, getContext } from '../../../extensions.js';
 import { eventSource, event_types, saveSettingsDebounced } from '../../../../script.js';
 
 const KEY = 'phone_call';
 const PROMPT_KEY = 'phone_call_mode';
 const CH_MS = 64; // one worklet frame at 16 kHz (1024 samples)
-const WORKER_URL = '/scripts/extensions/third-party/st-phone-call/stt-worker.js';
+const SAMPLE_RATE = 16000;
+const SCHEMA = 2; // bump when defaults change so old settings migrate
+const STT_FALLBACK_PATHS = [
+    '/scripts/extensions/third-party/Extension-Speech-Recognition/moonshine-local.js',
+    '/scripts/extensions/speech-recognition/moonshine-local.js',
+];
 
 const DEFAULTS = {
+    schema: SCHEMA,
     enabled: true,
     allowAiToCall: true,
-    sttModel: 'Xenova/whisper-base.en', // replace with the niagara-84m-batch.en repo id if it is transformers.js-compatible
-    useWebGPU: true,
+    sttModulePath: STT_FALLBACK_PATHS[0],
+    sttModel: 'UsefulSensors/moonshine-streaming-tiny',
     silenceMs: 600,
     bargeInMs: 250,
     vadThreshold: 0.02,
@@ -20,7 +25,14 @@ const DEFAULTS = {
 
 const settings = () => {
     const s = (extension_settings[KEY] ??= structuredClone(DEFAULTS));
+    if (s.schema !== SCHEMA) {
+        // Old Whisper/niagara values would break the Moonshine provider, so reset them.
+        s.sttModulePath = DEFAULTS.sttModulePath;
+        s.sttModel = DEFAULTS.sttModel;
+        s.schema = SCHEMA;
+    }
     for (const k of Object.keys(DEFAULTS)) if (!(k in s)) s[k] = DEFAULTS[k];
+    delete s.useWebGPU;
     return s;
 };
 const ctx = () => getContext();
@@ -44,75 +56,88 @@ const S = {
     worklet: null,
     sttReady: false,
     sttLoading: null,
-    loadResolve: null,
-    onLoadProgress: null,
-    pendingStt: new Map(),
-    sttId: 0,
     incomingMsg: '',
     ringTimeout: null,
     ringCtx: null,
     ringIv: null,
 };
 
-// ---------- speech recognition (Web Worker, created lazily) ----------
-let sttWorker = null;
+// ---------- speech recognition (Moonshine provider from the Speech Recognition extension) ----------
+let sttProvider = null;
 
-function getWorker() {
-    if (sttWorker) return sttWorker;
-    try {
-        sttWorker = new Worker(WORKER_URL, { type: 'module' });
-    } catch (err) {
-        console.error('[st-phone-call] could not create worker:', err);
-        return null;
-    }
-    sttWorker.onerror = (e) => {
-        console.error('[st-phone-call] worker error:', e.message || '(no message)', e.filename, e.lineno);
-        S.loadResolve?.({ type: 'error', error: 'speech worker failed to start (see console)' });
-    };
-    sttWorker.onmessage = (e) => {
-        const m = e.data;
-        if (m.type === 'progress') S.onLoadProgress?.(m.p);
-        if (m.type === 'ready' || m.type === 'error') S.loadResolve?.(m);
-        if (m.type === 'text') {
-            const resolve = S.pendingStt.get(m.id);
-            S.pendingStt.delete(m.id);
-            resolve?.(m.text);
+async function getSttProvider() {
+    const s = settings();
+    if (!sttProvider) {
+        const paths = [...new Set([s.sttModulePath, ...STT_FALLBACK_PATHS].filter(Boolean))];
+        const errors = [];
+        for (const path of paths) {
+            try {
+                const mod = await import(path);
+                if (!mod.MoonshineLocalSttProvider) throw new Error('no MoonshineLocalSttProvider export');
+                sttProvider = new mod.MoonshineLocalSttProvider();
+                console.debug('[st-phone-call] speech provider loaded from', path);
+                break;
+            } catch (err) {
+                errors.push(`${path}: ${err?.message ?? err}`);
+            }
         }
-    };
-    return sttWorker;
+        if (!sttProvider) throw new Error('Moonshine provider not found. Tried: ' + errors.join(' | '));
+    }
+    // Re-apply settings every call so model changes take effect without a reload.
+    sttProvider.loadSettings({ language: '', model: s.sttModel });
+    return sttProvider;
 }
 
+// Moonshine's processAudio() takes a Blob, so wrap the 16 kHz mono Float32 frames in a WAV.
+function encodeWav(samples, sampleRate = SAMPLE_RATE) {
+    const buf = new ArrayBuffer(44 + samples.length * 2);
+    const v = new DataView(buf);
+    const write = (o, str) => { for (let i = 0; i < str.length; i++) v.setUint8(o + i, str.charCodeAt(i)); };
+    write(0, 'RIFF');
+    v.setUint32(4, 36 + samples.length * 2, true);
+    write(8, 'WAVE');
+    write(12, 'fmt ');
+    v.setUint32(16, 16, true);
+    v.setUint16(20, 1, true); // PCM
+    v.setUint16(22, 1, true); // mono
+    v.setUint32(24, sampleRate, true);
+    v.setUint32(28, sampleRate * 2, true);
+    v.setUint16(32, 2, true);
+    v.setUint16(34, 16, true);
+    write(36, 'data');
+    v.setUint32(40, samples.length * 2, true);
+    let o = 44;
+    for (let i = 0; i < samples.length; i++, o += 2) {
+        const s = Math.max(-1, Math.min(1, samples[i]));
+        v.setInt16(o, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+    }
+    return new Blob([buf], { type: 'audio/wav' });
+}
+
+async function transcribeSamples(samples) {
+    const provider = await getSttProvider();
+    const text = await provider.processAudio(encodeWav(samples));
+    return String(text || '').trim();
+}
+
+// Loads the Moonshine pipeline by transcribing half a second of silence. Errors show up here, not mid-call.
 function loadStt() {
     if (S.sttReady) return Promise.resolve(true);
     if (S.sttLoading) return S.sttLoading;
-    const w = getWorker();
-    if (!w) { toast('Speech worker could not start. See console.', 'error'); return Promise.resolve(false); }
-    const s = settings();
-    const gpu = s.useWebGPU && !!navigator.gpu;
-    S.sttLoading = new Promise((res) => {
-        S.onLoadProgress = (p) => setStatus(`Preparing speech model… ${Math.round(p)}%`);
-        S.loadResolve = (m) => {
-            S.onLoadProgress = null;
+    S.sttLoading = (async () => {
+        try {
+            await transcribeSamples(new Float32Array(SAMPLE_RATE / 2));
+            S.sttReady = true;
+            return true;
+        } catch (err) {
+            console.error('[st-phone-call] speech model failed to load:', err);
+            toast(`Speech model failed: ${err?.message ?? err}`, 'error');
+            return false;
+        } finally {
             S.sttLoading = null;
-            if (m.type === 'ready') { S.sttReady = true; res(true); }
-            else { toast(`Speech model failed: ${m.error}`, 'error'); res(false); }
-        };
-        w.postMessage({
-            type: 'load',
-            model: s.sttModel,
-            device: gpu ? 'webgpu' : 'wasm',
-            dtype: gpu ? 'fp32' : 'q8',
-        });
-    });
+        }
+    })();
     return S.sttLoading;
-}
-
-function transcribe(audio) {
-    const id = ++S.sttId;
-    return new Promise((res) => {
-        S.pendingStt.set(id, res);
-        getWorker()?.postMessage({ type: 'transcribe', id, audio }, [audio.buffer]);
-    });
 }
 
 const HALLUCINATIONS = new Set(['thank you', 'thanks for watching', 'you', 'bye', 'the end', 'thanks', 'thank you very much']);
@@ -147,7 +172,7 @@ async function startMic() {
     S.micStream = await navigator.mediaDevices.getUserMedia({
         audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 },
     });
-    const ac = new AudioContext({ sampleRate: 16000 });
+    const ac = new AudioContext({ sampleRate: SAMPLE_RATE });
     S.audioCtx = ac;
     const url = URL.createObjectURL(new Blob([WORKLET], { type: 'application/javascript' }));
     await ac.audioWorklet.addModule(url);
@@ -188,7 +213,7 @@ function vad(frame) {
     if (!V.inSpeech) {
         V.pre.push(frame);
         V.preLen += frame.length;
-        while (V.preLen > 16000 * 0.3) { const f = V.pre.shift(); V.preLen -= f.length; }
+        while (V.preLen > SAMPLE_RATE * 0.3) { const f = V.pre.shift(); V.preLen -= f.length; }
         if (loud) {
             V.onset += CH_MS;
             // Need sustained speech to barge in on the AI; a short blip starts a normal turn.
@@ -220,19 +245,20 @@ function endUtterance() {
     V.silence = 0;
     document.querySelector('#pc-overlay')?.classList.remove('pc-listening');
     const total = chunks.reduce((a, c) => a + c.length, 0);
-    if (total < 16000 * 0.4) return; // under 0.4s is noise
+    if (total < SAMPLE_RATE * 0.4) return; // under 0.4s is noise
     const audio = new Float32Array(total);
     let o = 0;
     for (const c of chunks) { audio.set(c, o); o += c.length; }
-    transcribe(audio).then((text) => {
-        const t = (text || '').trim();
-        if (!isRealSpeech(t) || S.state !== 'connected') return;
-        addCaption('you', t);
-        sendTurn(t);
-    });
+    transcribeSamples(audio)
+        .catch((err) => { console.error('[st-phone-call] transcribe failed:', err); return ''; })
+        .then((text) => {
+            if (!isRealSpeech(text) || S.state !== 'connected') return;
+            addCaption('you', text);
+            sendTurn(text);
+        });
 }
 
-// ---------- speaking (native ST TTS) ----------
+// ---------- speaking (SillyTavern TTS) ----------
 function cleanForTts(text) {
     return String(text)
         .replace(/```[\s\S]*?```/g, '')
@@ -268,7 +294,7 @@ async function speakViaSt(text, gen) {
     await waitForAudioIdle(gen);
 }
 
-// Waits for ST's TTS <audio> to start and then finish. Gives up if it never starts.
+// Waits for TTS audio to start and then finish. Gives up if it never starts.
 function waitForAudioIdle(gen) {
     return new Promise((res) => {
         const t0 = performance.now();
@@ -356,12 +382,12 @@ async function startOutgoing() {
     buildUi();
     showCall('outgoing');
     ring(true);
-    const ready = await loadStt();
-    if (!ready) { ring(false); hideUi(); S.state = 'idle'; return; }
+    loadStt(); // load in the background; don't block the call on it
     await sleep(2000);
     ring(false);
     if (S.state !== 'outgoing') return;
     await connect();
+    if (!S.sttReady) setStatus('Loading speech model…');
     const c = ctx();
     beginReply();
     await c.executeSlashCommandsWithOptions(`/sys ${slashSafe('[Phone call connected. You picked up. Greet the user briefly, in character.]')}`);
@@ -559,9 +585,6 @@ function registerTool() {
         console.warn('[st-phone-call] registerFunctionTool not in context; AI calling disabled.');
         return;
     }
-    if (c.isToolCallingSupported && !c.isToolCallingSupported()) {
-        console.warn('[st-phone-call] current API does not support tool calling.');
-    }
     c.registerFunctionTool({
         name: 'phone_call_user',
         displayName: 'Phone call the user',
@@ -616,14 +639,14 @@ function buildSettings() {
       <div class="inline-drawer-content">
         <label class="checkbox_label"><input type="checkbox" data-k="enabled"> Enable phone calls</label>
         <label class="checkbox_label"><input type="checkbox" data-k="allowAiToCall"> Let the character call me</label>
-        <label class="checkbox_label"><input type="checkbox" data-k="useWebGPU"> Use WebGPU for speech (if available)</label>
-        <label>Speech model (Hugging Face id)<input class="text_pole" data-k="sttModel" type="text"></label>
+        <label>Speech Recognition provider file (path to moonshine-local.js)<input class="text_pole" data-k="sttModulePath" type="text"></label>
+        <label>Moonshine model<input class="text_pole" data-k="sttModel" type="text"></label>
         <label>Silence before reply (ms)<input class="text_pole" data-k="silenceMs" type="number"></label>
         <label>Barge-in speech (ms)<input class="text_pole" data-k="bargeInMs" type="number"></label>
         <label>Mic threshold (0–0.2)<input class="text_pole" data-k="vadThreshold" type="number" step="0.005"></label>
         <label>Ring duration (s)<input class="text_pole" data-k="ringSeconds" type="number"></label>
         <div class="flex-container">
-          <input class="menu_button" type="button" id="pc_preload" value="Download / warm up speech model">
+          <input class="menu_button" type="button" id="pc_preload" value="Load speech model">
         </div>
       </div>`;
     host.appendChild(d);
@@ -635,7 +658,10 @@ function buildSettings() {
         el.addEventListener('change', () => {
             const v = el.type === 'checkbox' ? el.checked : el.type === 'number' ? Number(el.value) : el.value;
             s[k] = v;
-            if (k === 'sttModel' || k === 'useWebGPU') S.sttReady = false; // reload on next call
+            if (k === 'sttModel' || k === 'sttModulePath') {
+                S.sttReady = false; // reload on next call
+                sttProvider = null;
+            }
             saveSettingsDebounced();
         });
     }
