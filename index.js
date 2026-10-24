@@ -28,7 +28,7 @@ const fmt = (sec) => `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, '0'
 
 // ---------- state ----------
 const S = {
-    state: 'idle', // idle | outgoing | incoming | connected
+    state: 'idle', // idle | outgoing | incoming | connecting | connected
     muted: false,
     awaitingReply: false,
     streamSpokenLen: 0,
@@ -76,7 +76,7 @@ function loadStt() {
             S.onLoadProgress = null;
             S.sttLoading = null;
             if (m.type === 'ready') { S.sttReady = true; res(true); }
-            else { toast(`Speech model failed: ${m.error}`); res(false); }
+            else { toast(`Speech model failed: ${m.error}`, 'error'); res(false); }
         };
         sttWorker.postMessage({
             type: 'load',
@@ -351,6 +351,7 @@ async function startOutgoing() {
 // Called by the tool when the model rings the user.
 function receiveCall(message) {
     if (S.state !== 'idle') return false;
+    S.state = 'incoming';
     S.incomingMsg = message;
     buildUi();
     showCall('incoming');
@@ -396,7 +397,7 @@ async function connect() {
     try {
         await startMic();
     } catch (err) {
-        toast('Microphone unavailable: ' + err.message);
+        toast('Microphone unavailable: ' + err.message, 'error');
         endCall();
         return;
     }
@@ -525,9 +526,10 @@ function addCaption(who, text) {
     el.textContent = (who === 'you' ? 'You: ' : '') + text;
 }
 
-function toast(msg) {
-    if (typeof window.toastr !== 'undefined') window.toastr.error(msg);
-    else console.error('[st-phone-call]', msg);
+// Shows a toastr notification. type is 'info', 'success', 'warning', or 'error'.
+function toast(msg, type = 'error') {
+    if (typeof window.toastr !== 'undefined') window.toastr[type](msg);
+    else console.log('[st-phone-call]', msg);
 }
 
 // ---------- tool: the model can ring the user ----------
@@ -615,9 +617,9 @@ function buildSettings() {
         });
     }
     d.querySelector('#pc_preload').onclick = async () => {
-        toast('Loading speech model…');
+        toast('Loading speech model…', 'info');
         const ok = await loadStt();
-        if (ok) toast('Speech model ready');
+        if (ok) toast('Speech model ready', 'success');
     };
 }
 
