@@ -4,6 +4,7 @@ import { eventSource, event_types, saveSettingsDebounced } from '../../../../scr
 const KEY = 'phone_call';
 const PROMPT_KEY = 'phone_call_mode';
 const CH_MS = 64; // one worklet frame at 16 kHz (1024 samples)
+const WORKER_URL = '/scripts/extensions/third-party/st-phone-call/stt-worker.js';
 
 const DEFAULTS = {
     enabled: true,
@@ -15,27 +16,7 @@ const DEFAULTS = {
     vadThreshold: 0.02,
     ringSeconds: 25,
 };
-// ---------- speech recognition (Web Worker) ----------
-let sttWorker = null;
-try {
-    sttWorker = new Worker(new URL('./stt-worker.js', import.meta.url), { type: 'module' });
-    sttWorker.onerror = (e) => {
-        console.error('[st-phone-call] worker error:', e.message || '(no message)', e.filename, e.lineno);
-        S.loadResolve?.({ type: 'error', error: e.message || 'worker failed (check console)' });
-    };
-    sttWorker.onmessage = (e) => {
-        const m = e.data;
-        if (m.type === 'progress') S.onLoadProgress?.(m.p);
-        if (m.type === 'ready' || m.type === 'error') S.loadResolve?.(m);
-        if (m.type === 'text') {
-            const resolve = S.pendingStt.get(m.id);
-            S.pendingStt.delete(m.id);
-            resolve?.(m.text);
-        }
-    };
-} catch (err) {
-    console.error('[st-phone-call] could not start worker:', err);
-}
+
 const settings = () => {
     const s = (extension_settings[KEY] ??= structuredClone(DEFAULTS));
     for (const k of Object.keys(DEFAULTS)) if (!(k in s)) s[k] = DEFAULTS[k];
@@ -72,23 +53,39 @@ const S = {
     ringIv: null,
 };
 
-// ---------- speech recognition (Web Worker) ----------
-const sttWorker = new Worker(new URL('./stt-worker.js', import.meta.url), { type: 'module' });
-sttWorker.onmessage = (e) => {
-    const m = e.data;
-    if (m.type === 'progress') S.onLoadProgress?.(m.p);
-    if (m.type === 'ready' || m.type === 'error') S.loadResolve?.(m);
-    if (m.type === 'text') {
-        const resolve = S.pendingStt.get(m.id);
-        S.pendingStt.delete(m.id);
-        resolve?.(m.text);
+// ---------- speech recognition (Web Worker, created lazily) ----------
+let sttWorker = null;
+
+function getWorker() {
+    if (sttWorker) return sttWorker;
+    try {
+        sttWorker = new Worker(WORKER_URL, { type: 'module' });
+    } catch (err) {
+        console.error('[st-phone-call] could not create worker:', err);
+        return null;
     }
-};
+    sttWorker.onerror = (e) => {
+        console.error('[st-phone-call] worker error:', e.message || '(no message)', e.filename, e.lineno);
+        S.loadResolve?.({ type: 'error', error: 'speech worker failed to start (see console)' });
+    };
+    sttWorker.onmessage = (e) => {
+        const m = e.data;
+        if (m.type === 'progress') S.onLoadProgress?.(m.p);
+        if (m.type === 'ready' || m.type === 'error') S.loadResolve?.(m);
+        if (m.type === 'text') {
+            const resolve = S.pendingStt.get(m.id);
+            S.pendingStt.delete(m.id);
+            resolve?.(m.text);
+        }
+    };
+    return sttWorker;
+}
 
 function loadStt() {
-    if (!sttWorker) { toast('Speech worker could not start. See console.', 'error'); return Promise.resolve(false); }
     if (S.sttReady) return Promise.resolve(true);
     if (S.sttLoading) return S.sttLoading;
+    const w = getWorker();
+    if (!w) { toast('Speech worker could not start. See console.', 'error'); return Promise.resolve(false); }
     const s = settings();
     const gpu = s.useWebGPU && !!navigator.gpu;
     S.sttLoading = new Promise((res) => {
@@ -99,7 +96,7 @@ function loadStt() {
             if (m.type === 'ready') { S.sttReady = true; res(true); }
             else { toast(`Speech model failed: ${m.error}`, 'error'); res(false); }
         };
-        sttWorker.postMessage({
+        w.postMessage({
             type: 'load',
             model: s.sttModel,
             device: gpu ? 'webgpu' : 'wasm',
@@ -113,7 +110,7 @@ function transcribe(audio) {
     const id = ++S.sttId;
     return new Promise((res) => {
         S.pendingStt.set(id, res);
-        sttWorker.postMessage({ type: 'transcribe', id, audio }, [audio.buffer]);
+        getWorker()?.postMessage({ type: 'transcribe', id, audio }, [audio.buffer]);
     });
 }
 
@@ -354,11 +351,12 @@ function setExt(on) {
 
 async function startOutgoing() {
     if (S.state !== 'idle') return;
+    S.state = 'outgoing';
     buildUi();
     showCall('outgoing');
     ring(true);
     const ready = await loadStt();
-    if (!ready) { ring(false); hideUi(); return; }
+    if (!ready) { ring(false); hideUi(); S.state = 'idle'; return; }
     await sleep(2000);
     ring(false);
     if (S.state !== 'outgoing') return;
