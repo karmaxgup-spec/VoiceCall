@@ -307,11 +307,34 @@ function beginReply() {
     S.streamSpokenLen = 0;
 }
 
+// Waits until SillyTavern is no longer generating (the stop button is hidden).
+async function waitForGenerationIdle(timeoutMs = 15000) {
+    const t0 = performance.now();
+    while (performance.now() - t0 < timeoutMs) {
+        const stop = document.querySelector('#mes_stop');
+        if (!stop || !stop.offsetParent) return true;
+        await sleep(100);
+    }
+    return false;
+}
+
+// Sends the transcript exactly like a typed message: fills the chat box and clicks Send.
 async function sendTurn(text) {
-    const c = ctx();
+    const ta = document.querySelector('#send_textarea');
+    const btn = document.querySelector('#send_but');
+    if (!ta || !btn) {
+        toast('Chat send box not found; cannot send speech.', 'error');
+        return;
+    }
+    if (!(await waitForGenerationIdle())) {
+        console.warn('[st-phone-call] previous generation still running; skipped turn:', text);
+        return;
+    }
+    // A leading "/" would run as a slash command in the chat box, so add a space in front.
+    ta.value = text.startsWith('/') ? ' ' + text : text;
+    ta.dispatchEvent(new Event('input', { bubbles: true }));
     beginReply();
-    await c.executeSlashCommandsWithOptions(`/send ${slashSafe(text)}`);
-    await c.executeSlashCommandsWithOptions('/trigger');
+    btn.click();
 }
 
 // Speak each finished sentence while the model is still streaming.
