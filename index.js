@@ -5,18 +5,12 @@ const KEY = 'phone_call';
 const PROMPT_KEY = 'phone_call_mode';
 const CH_MS = 64; // one worklet frame at 16 kHz (1024 samples)
 const SAMPLE_RATE = 16000;
-const SCHEMA = 2; // bump when defaults change so old settings migrate
-const STT_FALLBACK_PATHS = [
-    '/scripts/extensions/third-party/Extension-Speech-Recognition/moonshine-local.js',
-    '/scripts/extensions/speech-recognition/moonshine-local.js',
-];
+const SCHEMA = 3; // bump when defaults change so old settings migrate
 
 const DEFAULTS = {
     schema: SCHEMA,
     enabled: true,
     allowAiToCall: true,
-    sttModulePath: STT_FALLBACK_PATHS[0],
-    sttModel: 'UsefulSensors/moonshine-streaming-tiny',
     silenceMs: 600,
     bargeInMs: 250,
     vadThreshold: 0.02,
@@ -26,13 +20,13 @@ const DEFAULTS = {
 const settings = () => {
     const s = (extension_settings[KEY] ??= structuredClone(DEFAULTS));
     if (s.schema !== SCHEMA) {
-        // Old Whisper/niagara values would break the Moonshine provider, so reset them.
-        s.sttModulePath = DEFAULTS.sttModulePath;
-        s.sttModel = DEFAULTS.sttModel;
+        // Drop the old speech model settings; the Speech Recognition extension owns them now.
+        delete s.sttModulePath;
+        delete s.sttModel;
+        delete s.useWebGPU;
         s.schema = SCHEMA;
     }
     for (const k of Object.keys(DEFAULTS)) if (!(k in s)) s[k] = DEFAULTS[k];
-    delete s.useWebGPU;
     return s;
 };
 const ctx = () => getContext();
@@ -62,33 +56,19 @@ const S = {
     ringIv: null,
 };
 
-// ---------- speech recognition (Moonshine provider from the Speech Recognition extension) ----------
-let sttProvider = null;
-
-async function getSttProvider() {
-    const s = settings();
-    if (!sttProvider) {
-        const paths = [...new Set([s.sttModulePath, ...STT_FALLBACK_PATHS].filter(Boolean))];
-        const errors = [];
-        for (const path of paths) {
-            try {
-                const mod = await import(path);
-                if (!mod.MoonshineLocalSttProvider) throw new Error('no MoonshineLocalSttProvider export');
-                sttProvider = new mod.MoonshineLocalSttProvider();
-                console.debug('[st-phone-call] speech provider loaded from', path);
-                break;
-            } catch (err) {
-                errors.push(`${path}: ${err?.message ?? err}`);
-            }
-        }
-        if (!sttProvider) throw new Error('Moonshine provider not found. Tried: ' + errors.join(' | '));
+// ---------- speech recognition (the provider selected in Speech Recognition settings) ----------
+function getSelectedProvider() {
+    const api = window.speechRecognitionApi;
+    if (!api) throw new Error('Speech Recognition extension is missing the Phone Call patch (window.speechRecognitionApi).');
+    const provider = api.getProvider();
+    if (!provider) throw new Error('No speech provider is selected in Speech Recognition settings.');
+    if (typeof provider.processAudio !== 'function') {
+        throw new Error(`"${api.getProviderName()}" cannot transcribe recorded audio. Select a recording-based provider such as Moonshine, Whisper, or Groq.`);
     }
-    // Re-apply settings every call so model changes take effect without a reload.
-    sttProvider.loadSettings({ language: '', model: s.sttModel });
-    return sttProvider;
+    return provider;
 }
 
-// Moonshine's processAudio() takes a Blob, so wrap the 16 kHz mono Float32 frames in a WAV.
+// The providers take a WAV Blob, so wrap the 16 kHz mono Float32 frames in a WAV.
 function encodeWav(samples, sampleRate = SAMPLE_RATE) {
     const buf = new ArrayBuffer(44 + samples.length * 2);
     const v = new DataView(buf);
@@ -115,23 +95,24 @@ function encodeWav(samples, sampleRate = SAMPLE_RATE) {
 }
 
 async function transcribeSamples(samples) {
-    const provider = await getSttProvider();
+    const provider = getSelectedProvider();
     const text = await provider.processAudio(encodeWav(samples));
     return String(text || '').trim();
 }
 
-// Loads the Moonshine pipeline by transcribing half a second of silence. Errors show up here, not mid-call.
-function loadStt() {
-    if (S.sttReady) return Promise.resolve(true);
+// Checks the selected provider is usable. Local models load on their first real utterance,
+// so this doesn't send any audio, which keeps paid API providers from being billed for a warm-up.
+async function loadStt() {
+    if (S.sttReady) return true;
     if (S.sttLoading) return S.sttLoading;
     S.sttLoading = (async () => {
         try {
-            await transcribeSamples(new Float32Array(SAMPLE_RATE / 2));
+            getSelectedProvider();
             S.sttReady = true;
             return true;
         } catch (err) {
-            console.error('[st-phone-call] speech model failed to load:', err);
-            toast(`Speech model failed: ${err?.message ?? err}`, 'error');
+            console.error('[st-phone-call] speech provider unavailable:', err);
+            toast(err.message, 'error');
             return false;
         } finally {
             S.sttLoading = null;
@@ -250,7 +231,7 @@ function endUtterance() {
     let o = 0;
     for (const c of chunks) { audio.set(c, o); o += c.length; }
     transcribeSamples(audio)
-        .catch((err) => { console.error('[st-phone-call] transcribe failed:', err); return ''; })
+        .catch((err) => { console.error('[st-phone-call] transcribe failed:', err); toast(err.message, 'error'); return ''; })
         .then((text) => {
             if (!isRealSpeech(text) || S.state !== 'connected') return;
             addCaption('you', text);
@@ -382,12 +363,11 @@ async function startOutgoing() {
     buildUi();
     showCall('outgoing');
     ring(true);
-    loadStt(); // load in the background; don't block the call on it
+    loadStt(); // check the provider in the background; don't block the call on it
     await sleep(2000);
     ring(false);
     if (S.state !== 'outgoing') return;
     await connect();
-    if (!S.sttReady) setStatus('Loading speech model…');
     const c = ctx();
     beginReply();
     await c.executeSlashCommandsWithOptions(`/sys ${slashSafe('[Phone call connected. You picked up. Greet the user briefly, in character.]')}`);
@@ -403,7 +383,7 @@ function receiveCall(message) {
     showCall('incoming');
     ring(true);
     S.ringTimeout = setTimeout(() => { if (S.state === 'incoming') missedCall(); }, settings().ringSeconds * 1000);
-    loadStt(); // warm the model while it rings
+    loadStt(); // check the provider while it rings
     return true;
 }
 
@@ -637,16 +617,15 @@ function buildSettings() {
       <div class="inline-drawer-toggle inline-drawer-header"><b>Phone Call</b>
         <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div></div>
       <div class="inline-drawer-content">
+        <div><i>Speech input uses the provider selected in Speech Recognition settings.</i></div>
         <label class="checkbox_label"><input type="checkbox" data-k="enabled"> Enable phone calls</label>
         <label class="checkbox_label"><input type="checkbox" data-k="allowAiToCall"> Let the character call me</label>
-        <label>Speech Recognition provider file (path to moonshine-local.js)<input class="text_pole" data-k="sttModulePath" type="text"></label>
-        <label>Moonshine model<input class="text_pole" data-k="sttModel" type="text"></label>
         <label>Silence before reply (ms)<input class="text_pole" data-k="silenceMs" type="number"></label>
         <label>Barge-in speech (ms)<input class="text_pole" data-k="bargeInMs" type="number"></label>
         <label>Mic threshold (0–0.2)<input class="text_pole" data-k="vadThreshold" type="number" step="0.005"></label>
         <label>Ring duration (s)<input class="text_pole" data-k="ringSeconds" type="number"></label>
         <div class="flex-container">
-          <input class="menu_button" type="button" id="pc_preload" value="Load speech model">
+          <input class="menu_button" type="button" id="pc_check_stt" value="Check speech provider">
         </div>
       </div>`;
     host.appendChild(d);
@@ -656,19 +635,14 @@ function buildSettings() {
         if (el.type === 'checkbox') el.checked = !!s[k];
         else el.value = s[k];
         el.addEventListener('change', () => {
-            const v = el.type === 'checkbox' ? el.checked : el.type === 'number' ? Number(el.value) : el.value;
-            s[k] = v;
-            if (k === 'sttModel' || k === 'sttModulePath') {
-                S.sttReady = false; // reload on next call
-                sttProvider = null;
-            }
+            s[k] = el.type === 'checkbox' ? el.checked : el.type === 'number' ? Number(el.value) : el.value;
             saveSettingsDebounced();
         });
     }
-    d.querySelector('#pc_preload').onclick = async () => {
-        toast('Loading speech model…', 'info');
+    d.querySelector('#pc_check_stt').onclick = async () => {
+        S.sttReady = false;
         const ok = await loadStt();
-        if (ok) toast('Speech model ready', 'success');
+        if (ok) toast('Speech provider: ' + window.speechRecognitionApi.getProviderName(), 'success');
     };
 }
 
