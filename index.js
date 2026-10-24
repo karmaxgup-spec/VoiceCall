@@ -15,7 +15,27 @@ const DEFAULTS = {
     vadThreshold: 0.02,
     ringSeconds: 25,
 };
-
+// ---------- speech recognition (Web Worker) ----------
+let sttWorker = null;
+try {
+    sttWorker = new Worker(new URL('./stt-worker.js', import.meta.url), { type: 'module' });
+    sttWorker.onerror = (e) => {
+        console.error('[st-phone-call] worker error:', e.message || '(no message)', e.filename, e.lineno);
+        S.loadResolve?.({ type: 'error', error: e.message || 'worker failed (check console)' });
+    };
+    sttWorker.onmessage = (e) => {
+        const m = e.data;
+        if (m.type === 'progress') S.onLoadProgress?.(m.p);
+        if (m.type === 'ready' || m.type === 'error') S.loadResolve?.(m);
+        if (m.type === 'text') {
+            const resolve = S.pendingStt.get(m.id);
+            S.pendingStt.delete(m.id);
+            resolve?.(m.text);
+        }
+    };
+} catch (err) {
+    console.error('[st-phone-call] could not start worker:', err);
+}
 const settings = () => {
     const s = (extension_settings[KEY] ??= structuredClone(DEFAULTS));
     for (const k of Object.keys(DEFAULTS)) if (!(k in s)) s[k] = DEFAULTS[k];
@@ -66,6 +86,7 @@ sttWorker.onmessage = (e) => {
 };
 
 function loadStt() {
+    if (!sttWorker) { toast('Speech worker could not start. See console.', 'error'); return Promise.resolve(false); }
     if (S.sttReady) return Promise.resolve(true);
     if (S.sttLoading) return S.sttLoading;
     const s = settings();
