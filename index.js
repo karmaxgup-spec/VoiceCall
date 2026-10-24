@@ -1,3 +1,4 @@
+
 import { extension_settings, getContext } from '../../../extensions.js';
 import { eventSource, event_types, saveSettingsDebounced } from '../../../../script.js';
 
@@ -553,12 +554,15 @@ function toast(msg, type = 'error') {
 
 // ---------- tool: the model can ring the user ----------
 function registerTool() {
-    const TM = ctx().ToolManager;
-    if (!TM?.registerFunctionTool) {
-        console.warn('[st-phone-call] ToolManager not available; AI calling disabled.');
+    const c = ctx();
+    if (!c.registerFunctionTool) {
+        console.warn('[st-phone-call] registerFunctionTool not in context; AI calling disabled.');
         return;
     }
-    TM.registerFunctionTool({
+    if (c.isToolCallingSupported && !c.isToolCallingSupported()) {
+        console.warn('[st-phone-call] current API does not support tool calling.');
+    }
+    c.registerFunctionTool({
         name: 'phone_call_user',
         displayName: 'Phone call the user',
         description:
